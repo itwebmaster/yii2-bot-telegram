@@ -1,5 +1,5 @@
 {
-    "name": "alekseymikitin/yii2-bot-telegram",
+    "name": "itwebmaster/yii2-bot-telegram",
     "description": "bot telegram",
     "type": "yii2-extension",
     "keywords": ["yii2","extension"],
@@ -11,6 +11,7 @@
         }
     ],
     "require": {
+        "php": ">=7.4 <8.4",
         "yiisoft/yii2": "*"
     },
     "autoload": {
