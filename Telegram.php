@@ -1,12 +1,16 @@
 <?php
 
 namespace aki\telegram;
+
+use app\helpers\BotHelper;
+
 /**
  * @author Akbar Joudi <akbar.joody@gmail.com>
  */
 class Telegram extends \yii\base\Component
 {
     public $botToken;
+    public $reserveToken = null;
     public $botUsername;
     public $enabled = false;
     public $apiURL;
@@ -18,601 +22,824 @@ class Telegram extends \yii\base\Component
     public $proxy;
 
 
+    // Ключ в Redis для хранения тайм-аута
+    private $redisRetryKey = 'telegram:retry_after_until';
+
+    // Ключ для списка отложенных сообщений (json)
+    private $redisQueueKey = 'telegram:message_queue';
+
+    /** @var Connection Redis */
+    private $_redisInstance;
+
+    /**
+     * @var string|Connection
+     */
+    public $redis = 'redis';
+
+    /**
+     * @return \yii\redis\Connection
+     */
+    protected function getRedisInstance(): \yii\redis\Connection
+    {
+        if ($this->_redisInstance === null) {
+            if (is_string($this->redis)) {
+                $this->_redisInstance = \Yii::$app->get($this->redis);
+            } elseif ($this->redis instanceof \yii\redis\Connection) {
+                $this->_redisInstance = $this->redis;
+            } else {
+                throw new \yii\base\InvalidConfigException('Property "redis" must be a component ID or a Connection instance');
+            }
+        }
+        return $this->_redisInstance;
+    }
+
+    private function getCurrentToken(): string
+    {
+        $until = $this->getRedisInstance()->get($this->redisRetryKey);
+        if ($this->reserveToken && $until !== null && time() < (int)$until) {
+            return $this->reserveToken;
+        }
+        return $this->botToken;
+    }
+
+
+    // Вспомогательный метод для проверки, можно ли отправлять
+    protected function canSendNow(): bool
+    {
+        $until = $this->getRedisInstance()->get($this->redisRetryKey);
+        if ($until === null) {
+            return true; // ключа нет, можно отправлять
+        }
+        return time() >= (int)$until;
+    }
+
+    // Метод добавляет сообщение в очередь Redis
+    protected function enqueueMessage(string $method, array $params)
+    {
+        $payload = json_encode([
+            'method' => $method,
+            'params' => $params,
+            'timestamp' => time(),
+        ]);
+        $this->getRedisInstance()->rpush($this->redisQueueKey, $payload);
+    }
+
+    // Метод для отправки отложенных сообщений
+    public function flushQueue()
+    {
+        $redis = $this->getRedisInstance();
+
+        $retryUntil = $redis->get($this->redisRetryKey);
+        $now = time();
+
+        // Проверяем, можно ли отправлять основным токеном
+        $canSendMain = $retryUntil === null || $now >= (int)$retryUntil;
+
+        if ($canSendMain) {
+            // Если таймаут прошёл, то отправляем ВСЕ накопленные сообщения на основной токен,
+            // объединяя sendMessage в один, с префиксом "RESERVE TOKEN"
+            $messagesText = [];
+            $chatId = null;
+
+            while (true) {
+                $payload = $redis->lpop($this->redisQueueKey);
+                if ($payload === null) break;
+
+                $data = json_decode($payload, true);
+                if (!is_array($data) || !isset($data['method'], $data['params'])) continue;
+
+                if ($data['method'] === 'sendMessage' && isset($data['params']['text'])) {
+                    $messagesText[] = $data['params']['text'];
+                    if ($chatId === null && isset($data['params']['chat_id'])) {
+                        $chatId = $data['params']['chat_id'];
+                    }
+                } else {
+                    $url = $this->apiURL . $this->getCurrentToken() . "/" . $data['method'];
+                    $this->curl_call($url, $data['params']);
+                }
+            }
+
+            if (!empty($messagesText) && $chatId !== null) {
+                $fullText = "RESERVE TOKEN\n\n" . implode("\n\n", $messagesText);
+                $url = $this->apiURL . $this->getCurrentToken() . "/sendMessage";
+                $this->curl_call($url, ['chat_id' => $chatId, 'text' => $fullText]);
+            }
+
+        } else {
+            // Пока не прошёл таймаут — отправляем сразу все сообщения на резервный токен по одному
+
+            while (true) {
+                $payload = $redis->lpop($this->redisQueueKey);
+                if ($payload === null) break;
+
+                $data = json_decode($payload, true);
+                if (!is_array($data) || !isset($data['method'], $data['params'])) continue;
+
+                $url = $this->apiURL . $this->reserveToken . "/" . $data['method'];
+
+                // Добавляем префикс "RESERVE TOKEN" в текст сообщений sendMessage
+                if ($data['method'] === 'sendMessage' && isset($data['params']['text'])) {
+                    $data['params']['text'] = "RESERVE TOKEN\n\n" . $data['params']['text'];
+                }
+
+                $this->curl_call($url, $data['params']);
+            }
+        }
+    }
+
+
+
+    public function viewQueue(): array
+    {
+        $items = $this->getRedisInstance()->lrange($this->redisQueueKey, 0, -1);
+        $result = [];
+
+        foreach ($items as $i => $payload) {
+            $data = json_decode($payload, true);
+            if (!$data) continue;
+
+            $result[] = sprintf(
+                '#%d: [%s] at %s, params: %s',
+                $i,
+                $data['method'] ?? 'unknown',
+                isset($data['timestamp']) ? date('Y-m-d H:i:s', $data['timestamp']) : 'no time',
+                json_encode($data['params'] ?? [], JSON_UNESCAPED_UNICODE)
+            );
+        }
+
+        return $result;
+    }
+
     public function getMe()
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getMe");
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getMe");
         return $jsonResponse;
     }
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendMessage([
-    *       'chat_id' => $chat_id,
-    *       'text' => 'test',
-    *       'reply_markup' => json_encode($reply_markup),               //Optional
-    *       'reply_to_message_id' => $reply_to_message_id,              //Optional
-    *       'disable_web_page_preview' => $disable_web_page_preview,    //Optional
-    *       'remove_keyboard' => <bool>,                                //Optional
-    *       'parse_mode' => 'Markdown' | 'HTML',                        //Optional
-    *   ]);
-    */
-    public function sendMessage(array $option, $headers=[]){
-        $option['text'] = \preg_replace_callback('/\\\\u([0-9a-fA-F]{4})/', function ($match) {
-            return \mb_convert_encoding(\pack('H*', $match[1]), 'UTF-8', 'UCS-2BE');
-        }, $option['text']);
-        $text = \urlencode($option['text']);
-        $chat_ids = $option['chat_id'];
-        unset($option['chat_id']);
-        unset($option['text']);
-        if(\is_array($chat_ids)) {
-            $jsonResponses =[];
-            foreach ($chat_ids as $chat_id){
-                $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendMessage?chat_id=".$chat_id
-                    .'&text='.$text, $option, $headers);
-                $jsonResponses[] = $jsonResponse;
-            }
-            return $jsonResponses;
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendMessage([
+     *       'chat_id' => $chat_id,
+     *       'text' => 'test',
+     *       'reply_markup' => json_encode($reply_markup),               //Optional
+     *       'reply_to_message_id' => $reply_to_message_id,              //Optional
+     *       'disable_web_page_preview' => $disable_web_page_preview,    //Optional
+     *       'remove_keyboard' => <bool>,                                //Optional
+     *       'parse_mode' => 'Markdown' | 'HTML',                        //Optional
+     *   ]);
+     */
+    // Изменим curl_call, чтобы ловить 429 и Retry-After
+    private function curl_call($url, $option = [], $headers = [])
+    {
+        if (!$this->enabled) {
+            return [];
         }
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendMessage?chat_id=".$chat_ids
-            .'&text='.$text, $option, $headers);
+
+        // Если нельзя сейчас отправлять, но запрос - это метод отправки сообщений - складываем в очередь
+        if (!$this->canSendNow()) {
+            // Попытка определить метод из URL
+            if (preg_match('/bot(\d+:[\w-]+)\/(\w+)/', $url, $matches)) {
+                $method = $matches[2];
+                $this->enqueueMessage($method, $option);
+                return json_encode(['ok' => false, 'description' => 'Throttled, message queued']);
+            }
+        }
+
+        $attachments = ['photo', 'sticker', 'audio', 'document', 'video'];
+
+        $ch = \curl_init($url);
+        \curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        \curl_setopt($ch, CURLOPT_USERAGENT, "PostManGoBot 1.0");
+        \curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        \curl_setopt($ch, CURLOPT_HEADER, true); // Получать заголовки и тело вместе
+
+        foreach ($headers as $key => $val) {
+            \curl_setopt($ch, \constant($key), $val);
+        }
+
+        if ($this->proxy !== null) {
+            \curl_setopt($ch, CURLOPT_PROXY, "socks5://{$this->proxy}");
+        }
+
+        if (!empty($option)) {
+            \curl_setopt($ch, CURLOPT_POST, true);
+
+            foreach ($attachments as $attachment) {
+                if (isset($option[$attachment])) {
+                    $option[$attachment] = $this->curlFile($option[$attachment]);
+                    break;
+                }
+            }
+            \curl_setopt($ch, CURLOPT_POSTFIELDS, $option);
+        }
+
+        $response = \curl_exec($ch);
+
+        if ($response === false) {
+            $text = date('Y-m-d H:i:s') . ' error ' . curl_error($ch) . PHP_EOL;
+            \file_put_contents(\Yii::getAlias('@runtime/error_telegram.log'), $text, FILE_APPEND | LOCK_EX);
+            \curl_close($ch);
+            return false;
+        }
+
+        $header_size = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+        $header = substr($response, 0, $header_size);
+        $body = substr($response, $header_size);
+
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        \curl_close($ch);
+
+        // Если 429, парсим Retry-After и ставим таймаут в Redis
+        if ($http_code == 429) {
+            // Ищем Retry-After в заголовках
+            if (preg_match('/Retry-After:\s*(\d+)/i', $header, $matches)) {
+                $retryAfter = (int)$matches[1];
+                $until = time() + $retryAfter;
+                $this->getRedisInstance()->set($this->redisRetryKey, $until, 'NX', 'EX', $retryAfter + 10); // Добавим небольшой запас
+            }
+        }
+
+        return $body;
+    }
+
+    // Пример доработки sendMessage, чтобы сначала пытаться сбросить очередь, если можно отправлять
+    public function sendMessage(array $option)
+    {
+        $redis = $this->getRedisInstance();
+        $retryUntil = $redis->get($this->redisRetryKey);
+        $now = time();
+
+        $canSendMain = $retryUntil === null || $now >= (int)$retryUntil;
+
+        if ($canSendMain) {
+            // Можно отправлять основным токеном — кладём в очередь
+            $this->enqueueMessage('sendMessage', $option);
+        } else {
+            // Пока действует таймаут — сразу шлём на резервный токен,
+            // добавляя префикс к тексту
+            $option['text'] = "RESERVE TOKEN\n\n" . $option['text'];
+            $url = $this->apiURL . $this->reserveToken . "/sendMessage";
+            $this->curl_call($url, $option);
+        }
+    }
+
+
+    /**
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->forwardMessage([
+     *       'chat_id' => $chat_id,
+     *       'from_chat_id' => $from_chat_id,
+     *       'message_id' => $message_id,
+     *   ]);
+     */
+    public function forwardMessage(array $option){
+        $chat_id = $option['chat_id'];
+        unset($option['chat_id']);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/forwardMessage?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->forwardMessage([
-    *       'chat_id' => $chat_id,
-    *       'from_chat_id' => $from_chat_id,
-    *       'message_id' => $message_id,
-    *   ]);
-    */
-    public function forwardMessage(array $option){
-        $chat_id = $option['chat_id'];
-        unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/forwardMessage?chat_id=".$chat_id, $option);
-        return \json_decode($jsonResponse);
-    }
-    
-    /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendPhoto([
-    *       'chat_id' => $chat_id,
-    *       'photo' => 'path/to/test.jpg',//realpath
-    *       'caption' => $caption,
-    *       'reply_to_message_id' => $reply_to_message_id,
-    *       'reply_markup' => $reply_markup
-    *   ]);
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendPhoto([
+     *       'chat_id' => $chat_id,
+     *       'photo' => 'path/to/test.jpg',//realpath
+     *       'caption' => $caption,
+     *       'reply_to_message_id' => $reply_to_message_id,
+     *       'reply_markup' => $reply_markup
+     *   ]);
+     */
     public function sendPhoto(array $option){
         $chat_id = $option['chat_id'];
         unset($option['chat_id']);
         $jsonResponse = $this->curl_call($this->apiURL .
-                $this->botToken . "/sendPhoto?chat_id=".$chat_id, $option);
+            $this->getCurrentToken() . "/sendPhoto?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendAudio[
-    *       'chat_id' => $chat_id,
-    *       'audio' => 'path/to/test.ogg',//realpath
-    *       'caption' => '', 
-    *       'duration' => 0,
-    *       'reply_to_message_id' => $reply_to_message_id,
-    *       'reply_markup' => $reply_markup
-    *   ]);
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendAudio[
+     *       'chat_id' => $chat_id,
+     *       'audio' => 'path/to/test.ogg',//realpath
+     *       'caption' => '',
+     *       'duration' => 0,
+     *       'reply_to_message_id' => $reply_to_message_id,
+     *       'reply_markup' => $reply_markup
+     *   ]);
+     */
     public function sendAudio(array $option){
         $chat_id = $option['chat_id'];
         $caption = $option['caption'];
         unset($option['chat_id']);
         unset($option['caption']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendAudio?chat_id=".$chat_id.
-                '&caption='.$caption, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/sendAudio?chat_id=".$chat_id.
+            '&caption='.$caption, $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendDocument([
-    *       'chat_id' => $chat_id,
-    *       'document' => 'path/to/test.pdf',//realpath
-    *       'caption' => '',
-    *       'reply_to_message_id' => $reply_to_message_id,
-    *       'reply_markup' => $reply_markup
-    *   ]);
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendDocument([
+     *       'chat_id' => $chat_id,
+     *       'document' => 'path/to/test.pdf',//realpath
+     *       'caption' => '',
+     *       'reply_to_message_id' => $reply_to_message_id,
+     *       'reply_markup' => $reply_markup
+     *   ]);
+     */
     public function sendDocument(array $option){
         $chat_id = $option['chat_id'];
         $caption = $option['caption'];
         unset($option['chat_id']);
         unset($option['caption']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendDocument?chat_id=".$chat_id
-                .'&caption='.$caption, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/sendDocument?chat_id=".$chat_id
+            .'&caption='.$caption, $option);
         return \json_decode($jsonResponse);
     }
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendSticker([
-    *       'chat_id' => $chat_id,
-    *       'sticker' => 'path/to/test.webp',//realpath
-    *       'reply_to_message_id' => $reply_to_message_id,
-    *       'reply_markup' => $reply_markup
-    *   ]);
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendSticker([
+     *       'chat_id' => $chat_id,
+     *       'sticker' => 'path/to/test.webp',//realpath
+     *       'reply_to_message_id' => $reply_to_message_id,
+     *       'reply_markup' => $reply_markup
+     *   ]);
+     */
     public function sendSticker(array $option){
         $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendSticker?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/sendSticker?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendVideo([
-    *       'chat_id' => $chat_id,
-    *       'video' => 'path/to/test.mp4',//realpath
-    *       'duration' => 0,
-    *       'caption' => $caption,
-    *       'reply_to_message_id' => $reply_to_message_id,
-    *       'reply_markup' => $reply_markup
-    *   ]);
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendVideo([
+     *       'chat_id' => $chat_id,
+     *       'video' => 'path/to/test.mp4',//realpath
+     *       'duration' => 0,
+     *       'caption' => $caption,
+     *       'reply_to_message_id' => $reply_to_message_id,
+     *       'reply_markup' => $reply_markup
+     *   ]);
+     */
     public function sendVideo(array $option){
         $chat_id = $option['chat_id'];
         $caption = $option['caption'];
         unset($option['chat_id']);
         unset($option['caption']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken .
-                "/sendVideo?chat_id=".$chat_id
-                .'&caption='. $caption, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() .
+            "/sendVideo?chat_id=".$chat_id
+            .'&caption='. $caption, $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendVideo([
-    *       'chat_id' => $chat_id,
-    *       'latitude' => 37.7576793,
-    *       'longitude' => -122.5076402,
-    *       'disable_notification' => true,//true||false,
-    *       'reply_to_message_id' => $reply_to_message_id,
-    *       'reply_markup' => $reply_markup
-    *   ]);
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendVideo([
+     *       'chat_id' => $chat_id,
+     *       'latitude' => 37.7576793,
+     *       'longitude' => -122.5076402,
+     *       'disable_notification' => true,//true||false,
+     *       'reply_to_message_id' => $reply_to_message_id,
+     *       'reply_markup' => $reply_markup
+     *   ]);
+     */
     public function sendLocation(array $option){
         $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendLocation?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/sendLocation?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendChatAction([
-    *       'chat_id' => $chat_id,
-    *       'action' => 'upload_photo',// upload_photo or  record_video  or  upload_video or record_audio or 
-    *       // upload_audio or upload_document or find_location
-    *   ]);
-    *   
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendChatAction([
+     *       'chat_id' => $chat_id,
+     *       'action' => 'upload_photo',// upload_photo or  record_video  or  upload_video or record_audio or
+     *       // upload_audio or upload_document or find_location
+     *   ]);
+     *
+     */
     public function sendChatAction(array $option){
         $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendChatAction?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/sendChatAction?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getUserProfilePhotos([
-    *       'user_id' => $chat_id,
-    *       'offset' => $offset,//Sequential number of the first photo to be returned. By default, all photos are returned.
-    *       'limit' => $limit, //Limits the number of photos to be retrieved. Values between 1—100 are accepted. Defaults to 100.
-    *   ]);
-    *   
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getUserProfilePhotos([
+     *       'user_id' => $chat_id,
+     *       'offset' => $offset,//Sequential number of the first photo to be returned. By default, all photos are returned.
+     *       'limit' => $limit, //Limits the number of photos to be retrieved. Values between 1—100 are accepted. Defaults to 100.
+     *   ]);
+     *
+     */
     public function getUserProfilePhotos($option){
         $user_id = $option['user_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getUserProfilePhotos?user_id=".$user_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getUserProfilePhotos?user_id=".$user_id, $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getUpdates([
-    *       'offset' => $offset,//Identifier of the first update to be returned. Must be greater by one than the highest among the *            //identifiers of previously received updates. 
-    *           //By default, updates starting with the earliest unconfirmed update are returned.
-    *           //An update is considered confirmed as soon as getUpdates is called with an offset higher than its update_id.
-    *           //The negative offset can be specified to retrieve updates starting from -offset 
-    *           //update from the end of the updates queue.
-    *       'limit' => $limit,//Limits the number of updates to be retrieved. Values between 1—100 are accepted. Defaults to 100.
-    *       'timeout' => $timeout,//Timeout in seconds for long polling. Defaults to 0, i.e. usual short polling
-    *   ]);
-    *   
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getUpdates([
+     *       'offset' => $offset,//Identifier of the first update to be returned. Must be greater by one than the highest among the *            //identifiers of previously received updates.
+     *           //By default, updates starting with the earliest unconfirmed update are returned.
+     *           //An update is considered confirmed as soon as getUpdates is called with an offset higher than its update_id.
+     *           //The negative offset can be specified to retrieve updates starting from -offset
+     *           //update from the end of the updates queue.
+     *       'limit' => $limit,//Limits the number of updates to be retrieved. Values between 1—100 are accepted. Defaults to 100.
+     *       'timeout' => $timeout,//Timeout in seconds for long polling. Defaults to 0, i.e. usual short polling
+     *   ]);
+     *
+     */
     public function getUpdates(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getUpdates", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getUpdates", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->setWebhook([
-    *       'url' => $url,
-    *   ]);
-    *   
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->setWebhook([
+     *       'url' => $url,
+     *   ]);
+     *
+     */
     public function setWebhook(array $option = []){
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/setWebhook", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/setWebhook", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getChat([
-    *       'chat_id' => '3343545121',
-    *   ]);
-    *   
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getChat([
+     *       'chat_id' => '3343545121',
+     *   ]);
+     *
+     */
     public function getChat(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getChat", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getChat", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getChatAdministrators([
-    *       'chat_id' => '3343545121',
-    *   ]);
-    *   Use this method to get a list of administrators in a chat.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getChatAdministrators([
+     *       'chat_id' => '3343545121',
+     *   ]);
+     *   Use this method to get a list of administrators in a chat.
+     */
     public function getChatAdministrators(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getChatAdministrators", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getChatAdministrators", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getChatMembersCount([
-    *       'chat_id' => '3343545121',
-    *   ]);
-    *   Use this method to get the number of members in a chat. Returns Int on success.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getChatMembersCount([
+     *       'chat_id' => '3343545121',
+     *   ]);
+     *   Use this method to get the number of members in a chat. Returns Int on success.
+     */
     public function getChatMembersCount(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getChatMembersCount", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getChatMembersCount", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getChatMember([
-    *       'chat_id' => '3343545121', //Unique identifier for the target chat or 
-    *            //username of the target supergroup or channel (in  the format @channelusername)
-    *       'user_id' => 243243,//Unique identifier of the target user
-    *   ]);
-    *   Use this method to get information about a member of a chat.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getChatMember([
+     *       'chat_id' => '3343545121', //Unique identifier for the target chat or
+     *            //username of the target supergroup or channel (in  the format @channelusername)
+     *       'user_id' => 243243,//Unique identifier of the target user
+     *   ]);
+     *   Use this method to get information about a member of a chat.
+     */
     public function getChatMember(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getChatMember", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getChatMember", $option);
         return \json_decode($jsonResponse);
     }
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->answerCallbackQuery([
-    *       'callback_query_id' => '3343545121', //require
-    *       'text' => 'text', //Optional
-    *       'show_alert' => 'my alert',  //Optional
-    *       'url' => 'http://sample.com', //Optional
-    *       'cache_time' => 123231,  //Optional
-    *   ]);
-    *   Use this method to send answers to callback queries sent from inline keyboards. 
-    *   The answer will be displayed to the user as a notification at the top of the chat screen or as an alert.
-    *  On success, True is returned.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->answerCallbackQuery([
+     *       'callback_query_id' => '3343545121', //require
+     *       'text' => 'text', //Optional
+     *       'show_alert' => 'my alert',  //Optional
+     *       'url' => 'http://sample.com', //Optional
+     *       'cache_time' => 123231,  //Optional
+     *   ]);
+     *   Use this method to send answers to callback queries sent from inline keyboards.
+     *   The answer will be displayed to the user as a notification at the top of the chat screen or as an alert.
+     *  On success, True is returned.
+     */
     public function answerCallbackQuery(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/answerCallbackQuery", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/answerCallbackQuery", $option);
         return \json_decode($jsonResponse);
     }
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->editMessageText([
-    *       'chat_id' => '3343545121', //Optional
-    *       'message_id' => 13123, //Optional
-    *       'inline_message_id' => 'my alert',  //Optional
-    *       'text' => 'my text', //require
-    *       'parse_mode' => 123231,  //Optional
-    *       'disable_web_page_preview' => false or true,  //Optional
-    *       'reply_markup' => Type InlineKeyboardMarkup,  //Optional
-    *       'remove_keyboard' => <bool>,                  //Optional
-    *       'parse_mode' => 'Markdown' | 'HTML',          //Optional
-    *   ]);
-    *   Use this method to edit text and game messages sent by the bot or via the bot (for inline bots). On success,
-    *  if edited message is sent by the bot, the edited Message is returned, otherwise True is returned.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->editMessageText([
+     *       'chat_id' => '3343545121', //Optional
+     *       'message_id' => 13123, //Optional
+     *       'inline_message_id' => 'my alert',  //Optional
+     *       'text' => 'my text', //require
+     *       'parse_mode' => 123231,  //Optional
+     *       'disable_web_page_preview' => false or true,  //Optional
+     *       'reply_markup' => Type InlineKeyboardMarkup,  //Optional
+     *       'remove_keyboard' => <bool>,                  //Optional
+     *       'parse_mode' => 'Markdown' | 'HTML',          //Optional
+     *   ]);
+     *   Use this method to edit text and game messages sent by the bot or via the bot (for inline bots). On success,
+     *  if edited message is sent by the bot, the edited Message is returned, otherwise True is returned.
+     */
     public function editMessageText(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/editMessageText", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/editMessageText", $option);
         return \json_decode($jsonResponse);
     }
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->editMessageText([
-    *       'chat_id' => '3343545121', //Required
-    *       'message_id' => 13123, //Optional
-    *       'inline_message_id' => 'my alert',  //Optional
-    *       'caption' => 'my text', //require
-    *       'reply_markup' => Type InlineKeyboardMarkup,  //Optional
-    *   ]);
-    *   
-    *   Use this method to edit captions of messages sent by the bot or via the bot (for inline bots). On success, 
-    *    if edited message is sent by the bot, the edited Message is returned, otherwise True is returned.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->editMessageText([
+     *       'chat_id' => '3343545121', //Required
+     *       'message_id' => 13123, //Optional
+     *       'inline_message_id' => 'my alert',  //Optional
+     *       'caption' => 'my text', //require
+     *       'reply_markup' => Type InlineKeyboardMarkup,  //Optional
+     *   ]);
+     *
+     *   Use this method to edit captions of messages sent by the bot or via the bot (for inline bots). On success,
+     *    if edited message is sent by the bot, the edited Message is returned, otherwise True is returned.
+     */
     public function editMessageCaption(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/editMessageCaption", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/editMessageCaption", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->sendGame([
-    *       'chat_id' => '3343545121', //Required
-    *       'game_short_name' => 'myGame', //Required
-    *       'disable_notification' => true,  //true or false Optional
-    *       'reply_to_message_id' => 123121, //Optional
-    *       'reply_markup' => Type InlineKeyboardMarkup,  //Optional
-    *   ]);
-    *   
-    *   Use this method to send a game. On success, the sent Message is returned. 
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->sendGame([
+     *       'chat_id' => '3343545121', //Required
+     *       'game_short_name' => 'myGame', //Required
+     *       'disable_notification' => true,  //true or false Optional
+     *       'reply_to_message_id' => 123121, //Optional
+     *       'reply_markup' => Type InlineKeyboardMarkup,  //Optional
+     *   ]);
+     *
+     *   Use this method to send a game. On success, the sent Message is returned.
+     */
     public function sendGame(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/sendGame", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/sendGame", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->Game([
-    *       'title' => 'Title of the game', //Required
-    *       'description' => 'String', //Required
-    *       'photo' => Array of PhotoSize,  //Photo that will be displayed in the game message in chats
-    *       'text' => 'String', //Optional
-    *       'text_entities' => Array of MessageEntity,  //Optional
-    *		'animation' => instance of Animation, //Optional
-    *   ]);
-    *   
-    *   Use this method to send a game. On success, the sent Message is returned. 
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->Game([
+     *       'title' => 'Title of the game', //Required
+     *       'description' => 'String', //Required
+     *       'photo' => Array of PhotoSize,  //Photo that will be displayed in the game message in chats
+     *       'text' => 'String', //Optional
+     *       'text_entities' => Array of MessageEntity,  //Optional
+     *		'animation' => instance of Animation, //Optional
+     *   ]);
+     *
+     *   Use this method to send a game. On success, the sent Message is returned.
+     */
     public function Game(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/Game", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/Game", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->Animation([
-    *       'file_id' => String, //Required
-    *       'thumb' => PhotoSize, //Optional
-    *       'file_name' => String,  //Optional
-    *       'mime_type' => String, //Optional
-    *   ]);
-    *   
-    *   You can provide an animation for your game so that it looks stylish 
-    * 	in chats (check out Lumberjack for an example). This object represents an animation file to 
-    * 	be displayed in the message containing a game. 
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->Animation([
+     *       'file_id' => String, //Required
+     *       'thumb' => PhotoSize, //Optional
+     *       'file_name' => String,  //Optional
+     *       'mime_type' => String, //Optional
+     *   ]);
+     *
+     *   You can provide an animation for your game so that it looks stylish
+     * 	in chats (check out Lumberjack for an example). This object represents an animation file to
+     * 	be displayed in the message containing a game.
+     */
     public function Animation(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/Animation", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/Animation", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->CallbackGame([
-    *       'user_id' => Integer, //Required
-    *       'score' => Integer, //Required
-    *       'force' => Boolean,  //Optional
-    *       'disable_edit_message' => Boolean, //Optional
-	*       'chat_id' => Integer,  //Integer
-	*       'message_id' => Integer,  //Optional
-	*       'inline_message_id' => String,  //Optional
-    *   ]);
-    *   
-    *   Use this method to set the score of the specified user in a game. On success,
-    *	if the message was sent by the bot, returns the edited Message, otherwise returns True.
-    *	Returns an error, if the new score is not greater than the user's current score in the chat and force is False.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->CallbackGame([
+     *       'user_id' => Integer, //Required
+     *       'score' => Integer, //Required
+     *       'force' => Boolean,  //Optional
+     *       'disable_edit_message' => Boolean, //Optional
+     *       'chat_id' => Integer,  //Integer
+     *       'message_id' => Integer,  //Optional
+     *       'inline_message_id' => String,  //Optional
+     *   ]);
+     *
+     *   Use this method to set the score of the specified user in a game. On success,
+     *	if the message was sent by the bot, returns the edited Message, otherwise returns True.
+     *	Returns an error, if the new score is not greater than the user's current score in the chat and force is False.
+     */
     public function CallbackGame(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/CallbackGame", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/CallbackGame", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->getGameHighScores([
-    *       'user_id' => Integer, //Required
-    *       'chat_id' => Integer, //Optional
-    *       'message_id' => Integer,  //Optional
-    *       'inline_message_id' => String, //Optional
-    *   ]);
-    *   
-    *   Use this method to get data for high score tables. 
-    *	Will return the score of the specified user and several of his neighbors in a game.
-    *	On success, returns an Array of GameHighScore objects.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->getGameHighScores([
+     *       'user_id' => Integer, //Required
+     *       'chat_id' => Integer, //Optional
+     *       'message_id' => Integer,  //Optional
+     *       'inline_message_id' => String, //Optional
+     *   ]);
+     *
+     *   Use this method to get data for high score tables.
+     *	Will return the score of the specified user and several of his neighbors in a game.
+     *	On success, returns an Array of GameHighScore objects.
+     */
     public function getGameHighScores(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getGameHighScores", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getGameHighScores", $option);
         return \json_decode($jsonResponse);
     }
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->GameHighScore([
-    *       'position' => Integer, //Required-Position in high score table for the game
-    *       'user' => User, //Optional
-    *       'score' => Integer,  //Optional
-    *   ]);
-    *   
-    *   This object represents one row of the high scores table for a game.	
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->GameHighScore([
+     *       'position' => Integer, //Required-Position in high score table for the game
+     *       'user' => User, //Optional
+     *       'score' => Integer,  //Optional
+     *   ]);
+     *
+     *   This object represents one row of the high scores table for a game.
+     */
     public function GameHighScore(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/GameHighScore", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/GameHighScore", $option);
         return \json_decode($jsonResponse);
     }
 
     //----------------------begin inline method--------------------------//
-    
+
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->answerInlineQuery([
-    *       'inline_query_id' => Integer, //Required-Position in high score table for the game
-    *       'user' => User, //Optional
-    *       'score' => Integer,  //Optional
-    *   ]);
-    *   
-    *   This object represents one row of the high scores table for a game.	
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->answerInlineQuery([
+     *       'inline_query_id' => Integer, //Required-Position in high score table for the game
+     *       'user' => User, //Optional
+     *       'score' => Integer,  //Optional
+     *   ]);
+     *
+     *   This object represents one row of the high scores table for a game.
+     */
     public function answerInlineQuery(array $option = [])
     {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/answerInlineQuery", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/answerInlineQuery", $option);
         return \json_decode($jsonResponse);
     }
 
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->kickChatMember([
-    *       'chat_id' => Integer, //Unique identifier for the target group or username of the target supergroup or channel
-    *       'user_id' => Integer, //Unique identifier of the target user
-    *       'until_date' => Integer,  //Date when the user will be unbanned, unix time. 
-    *								 //If user is banned for more than 366 days or less than 30 seconds from the 
-    *								//current time they are considered to be banned forever
-    *   ]);
-    *   
-    *   This object represents one row of the high scores table for a game.	
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->kickChatMember([
+     *       'chat_id' => Integer, //Unique identifier for the target group or username of the target supergroup or channel
+     *       'user_id' => Integer, //Unique identifier of the target user
+     *       'until_date' => Integer,  //Date when the user will be unbanned, unix time.
+     *								 //If user is banned for more than 366 days or less than 30 seconds from the
+     *								//current time they are considered to be banned forever
+     *   ]);
+     *
+     *   This object represents one row of the high scores table for a game.
+     */
     public function kickChatMember(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/kickChatMember?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/kickChatMember?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
 
     /**
-    *   @var Array 
-    *   sample
-    *   Yii::$app->telegram->restrictChatMember([
-    *       'chat_id' => Integer, //Unique identifier for the target group or username of the target supergroup or *                              //channel
-    *       'user_id' => Integer, //Unique identifier of the target user
-    *       'until_date' => Integer,  //Date when the user will be unbanned, unix time. 
-    *								 //If user is banned for more than 366 days or less than 30 seconds from the 
-    *								//current time they are considered to be banned forever
-    *       'can_send_messages' => Boolean	//Pass True, if the user can send text messages, 
-    * 										//contacts, locations and venues
-    *   ]);
-    *   
-    *   Use this method to restrict a user in a supergroup. The bot must be an administrator in the supergroup for *    this to work and must have the appropriate admin rights. Pass True for all boolean parameters to lift *        restrictions from a user. Returns True on success.
-    */
+     *   @var Array
+     *   sample
+     *   Yii::$app->telegram->restrictChatMember([
+     *       'chat_id' => Integer, //Unique identifier for the target group or username of the target supergroup or *                              //channel
+     *       'user_id' => Integer, //Unique identifier of the target user
+     *       'until_date' => Integer,  //Date when the user will be unbanned, unix time.
+     *								 //If user is banned for more than 366 days or less than 30 seconds from the
+     *								//current time they are considered to be banned forever
+     *       'can_send_messages' => Boolean	//Pass True, if the user can send text messages,
+     * 										//contacts, locations and venues
+     *   ]);
+     *
+     *   Use this method to restrict a user in a supergroup. The bot must be an administrator in the supergroup for *    this to work and must have the appropriate admin rights. Pass True for all boolean parameters to lift *        restrictions from a user. Returns True on success.
+     */
     public function restrictChatMember(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/restrictChatMember?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/restrictChatMember?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
 
     public function promoteChatMember(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/promoteChatMember?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/promoteChatMember?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function exportChatInviteLink(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/exportChatInviteLink?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/exportChatInviteLink?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function deleteChatPhoto(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/deleteChatPhoto?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/deleteChatPhoto?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function setChatTitle(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/setChatTitle?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/setChatTitle?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function setChatDescription(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/setChatDescription?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/setChatDescription?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function unpinChatMessage(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/unpinChatMessage?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/unpinChatMessage?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
@@ -620,32 +847,32 @@ class Telegram extends \yii\base\Component
 
     public function pinChatMessage(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/pinChatMessage?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/pinChatMessage?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function leaveChat(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/leaveChat?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/leaveChat?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
     public function setChatStickerSet(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/setChatStickerSet?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/setChatStickerSet?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
     public function deleteChatStickerSet(array $option = [])
     {
-    	$chat_id = $option['chat_id'];
+        $chat_id = $option['chat_id'];
         unset($option['chat_id']);
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/deleteChatStickerSet?chat_id=".$chat_id, $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/deleteChatStickerSet?chat_id=".$chat_id, $option);
         return \json_decode($jsonResponse);
     }
 
@@ -657,60 +884,18 @@ class Telegram extends \yii\base\Component
     }
 
     /**
-    * Yii::$app->telegram->getFile([
-	*		'file_id' => $file_id
-    *	]);
-    *
-    */
+     * Yii::$app->telegram->getFile([
+     *		'file_id' => $file_id
+     *	]);
+     *
+     */
     public function getFile($option) {
-        $jsonResponse = $this->curl_call($this->apiURL . $this->botToken . "/getFile", $option);
+        $jsonResponse = $this->curl_call($this->apiURL . $this->getCurrentToken() . "/getFile", $option);
         return \json_decode($jsonResponse);
     }
 
     private function array_push_assoc(&$array, $key, $value){
-       $array[$key] = $value;
-    }
-
-    private function curl_call($url, $option=array(), $headers=array()){
-
-        if (!$this->enabled) {
-            return [];
-        }
-
-        $attachments = ['photo', 'sticker', 'audio', 'document', 'video'];
-        
-        $ch = \curl_init($url);
-        \curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        \curl_setopt($ch, CURLOPT_USERAGENT, "PostManGoBot 1.0");
-        \curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-
-        foreach ($headers as $key=>$val) {
-            \curl_setopt($ch, \constant($key), $val);
-        }
-
-        if ($this->proxy !== null) {
-            // if a proxy string is specified, add header
-            \curl_setopt($ch, CURLOPT_PROXY, "socks5://{$this->proxy}");
-        }
-
-        if (!empty($option)) {
-            \curl_setopt($ch, CURLOPT_POST, true);
-
-            foreach($attachments as $attachment){
-                if(isset($option[$attachment])){
-                    $option[$attachment] = $this->curlFile($option[$attachment]);
-                    break;
-                }
-            }
-            \curl_setopt($ch, CURLOPT_POSTFIELDS, $option); 
-        }
-        $r = \curl_exec($ch);
-        if($r == false){
-            $text = \date('Y-m-d H:i:s').' eroror '.curl_error($ch).PHP_EOL;
-            \file_put_contents(\Yii::getAlias('@runtime/error_telegram.log'), $text, FILE_APPEND | LOCK_EX);
-        }
-        \curl_close($ch);
-        return $r;
+        $array[$key] = $value;
     }
 
     private function curlFile($path){
@@ -734,7 +919,7 @@ class Telegram extends \yii\base\Component
             return true;
         return false;
     }
-    
+
     //Call the function in input action by Hook-URL
     public function getContentFromHook(){
         if(empty($this->hookContent)) {
