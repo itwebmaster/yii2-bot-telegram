@@ -2,6 +2,8 @@ Yii2 bot telegram
 ============
 for web application yii2
 
+> 📘 Looking for end-to-end API usage guidance? See the new comprehensive reference in [`docs/api-reference.md`](docs/api-reference.md).
+
 Create your first bot
 ------------
 1. Message @botfather https://telegram.me/botfather with the following text: ```/newbot``` If you don't know how to message by username, click the search field on your Telegram app and type ```@botfather```, where you should be able to initiate a conversation. Be careful not to send it to the wrong contact, because some users has similar usernames to ```botfather```.
@@ -81,47 +83,12 @@ to the require section of your `composer.json` file.
 
 Method list usable
 -----
-list methods
-```
-getMe
-sendMessage
-forwardMessage
-sendPhoto
-sendAudio
-sendDocument
-sendSticker
-sendVideo
-sendLocation
-sendChatAction
-getUserProfilePhotos
-getUpdates
-setWebhook
-getChat
-getChatAdministrators
-getChatMembersCount
-getChatMember
-answerCallbackQuery
-editMessageText
-editMessageCaption
-sendGame
-Game
-Animation
-CallbackGame
-getGameHighScores
-GameHighScore
-answerInlineQuery
-setChatStickerSet
-deleteChatStickerSet
-leaveChat
-pinChatMessage
-unpinChatMessage
-setChatDescription
-setChatTitle
-deleteChatPhoto 
-exportChatInviteLink 
-promoteChatMember
-restrictChatMember
-```
+An annotated description of every public method, including parameter breakdowns and runnable examples, now lives in [`docs/api-reference.md`](docs/api-reference.md). Use that document as the authoritative reference for:
+
+- Messaging helpers (`sendMessage`, `sendPhoto`, etc.)
+- Chat administration utilities (`promoteChatMember`, `setChatStickerSet`, and more)
+- Inline, callback, and game integrations
+- Queueing, rate-limit handling, and webhook helpers
 
 Usage
 -----
@@ -167,6 +134,8 @@ send photo by :
 	'caption' => 'this is test'
 ]); ?>
 ```
+
+For advanced configuration (reserve token, Redis queue control, proxy support) and a walkthrough of every API, consult [`docs/api-reference.md`](docs/api-reference.md).
 
 
 
