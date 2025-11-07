@@ -2,6 +2,10 @@ Yii2 bot telegram
 ============
 for web application yii2
 
+Documentation
+------------
+Comprehensive component usage, configuration, and API details are available in `docs/api-reference.md`.
+
 Create your first bot
 ------------
 1. Message @botfather https://telegram.me/botfather with the following text: ```/newbot``` If you don't know how to message by username, click the search field on your Telegram app and type ```@botfather```, where you should be able to initiate a conversation. Be careful not to send it to the wrong contact, because some users has similar usernames to ```botfather```.
